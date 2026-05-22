@@ -38,15 +38,6 @@ OKX_API_PASSPHRASE = os.environ["OKX_API_PASSPHRASE"]
 BYPASS_CODE = os.environ.get("BYPASS_CODE", "00000000010101010")
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
-# Opcional en Render:
-# AFFILIATE_CODES=ELTRADERROLO,71790605,CRIPTOCRITERIO,FLANDERSYFRED
-# Si queda vacío, /afiliado solo valida si OKX devuelve ese UID dentro de tu API de afiliado.
-AFFILIATE_CODES = [
-    x.strip().upper()
-    for x in os.environ.get("AFFILIATE_CODES", "").split(",")
-    if x.strip()
-]
-
 # En Render usar:
 # DB_PATH=/var/data/trader_rolo_bot.db
 DB_PATH = os.environ.get("DB_PATH", "/var/data/trader_rolo_bot.db")
@@ -91,12 +82,10 @@ def ts_to_human(value):
         return ""
 
     try:
-        # Timestamp en milisegundos
         if value.isdigit() and len(value) >= 12:
             dt = datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
             return dt.astimezone(TZ_AR).strftime("%Y-%m-%d %H:%M:%S")
 
-        # Timestamp en segundos
         if value.isdigit() and len(value) == 10:
             dt = datetime.fromtimestamp(int(value), tz=timezone.utc)
             return dt.astimezone(TZ_AR).strftime("%Y-%m-%d %H:%M:%S")
@@ -397,20 +386,6 @@ def get_uid_report(uid):
     }
 
 
-def uid_matches_allowed_affiliate(uid):
-    report = get_uid_report(uid)
-
-    if report is None:
-        return False
-
-    # Si no configuraste AFFILIATE_CODES, cualquier UID que tu API pueda ver cuenta como válido.
-    if not AFFILIATE_CODES:
-        return True
-
-    affiliate_code = str(report.get("affiliate_code") or "").upper().strip()
-    return affiliate_code in AFFILIATE_CODES
-
-
 # ─────────────────────────────
 # FORMATOS DE REPORTE ADMIN
 # ─────────────────────────────
@@ -504,7 +479,9 @@ def private_rules_text(user):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Bienvenido a {GROUP_NAME}.\n\n"
-        "Solicita el acceso al grupo y envíame tu UID de OKX por privado para validar tu ingreso."
+        "Solicita el acceso al grupo y envíame tu UID de OKX por privado para validar tu ingreso.\n\n"
+        "Si solo quieres verificar si tu UID está registrado bajo el afiliado, usa:\n"
+        "/verificaruid TU_UID"
     )
 
 
@@ -586,6 +563,53 @@ async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────
+# PÚBLICO: VERIFICAR UID CONTRA AFILIADO
+# ─────────────────────────────
+async def verificaruid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "Para verificar tu UID, escríbeme por privado y usa:\n\n"
+            "/verificaruid TU_UID"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Uso:\n"
+            "/verificaruid 123456789\n\n"
+            "Envía tu UID de OKX usando solo números."
+        )
+        return
+
+    uid = context.args[0].strip()
+
+    if not uid.isnumeric():
+        await update.message.reply_text("UID inválido. Usa solo números.")
+        return
+
+    try:
+        resp = okx_affiliate_detail(uid)
+
+        if resp.get("code") == "0" and resp.get("data"):
+            await update.message.reply_text(
+                "✅ Tu UID aparece registrado correctamente bajo el afiliado correspondiente.\n\n"
+                "Puedes continuar con el proceso de acceso a la comunidad."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Este UID no aparece registrado bajo el afiliado correspondiente.\n\n"
+                "Verifica que copiaste bien tu UID de OKX y que creaste tu cuenta con el link o código correcto."
+            )
+
+    except Exception as e:
+        print(f"Error verificando UID público={uid}: {e}")
+        await update.message.reply_text(
+            "❌ Hubo un error consultando OKX.\n"
+            "Intenta nuevamente más tarde."
+        )
+
+
+# ─────────────────────────────
 # USUARIO: CONSULTAR VOLUMEN
 # ─────────────────────────────
 async def volumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -638,49 +662,6 @@ async def volumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────
-# USUARIO: CONSULTAR SI SU UID ESTÁ CON AFILIADO AUTORIZADO
-# ─────────────────────────────
-async def afiliado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text(
-            "Por seguridad, usa este comando por privado con el bot."
-        )
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "Uso:\n"
-            "/afiliado 123456789\n\n"
-            "Envía tu UID de OKX para verificar si está registrado correctamente."
-        )
-        return
-
-    uid = context.args[0].strip()
-
-    if not uid.isnumeric():
-        await update.message.reply_text("UID inválido. Usa solo números.")
-        return
-
-    try:
-        matched = uid_matches_allowed_affiliate(uid)
-
-        if matched:
-            await update.message.reply_text(
-                "✅ Tu UID está registrado correctamente."
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Tu UID no aparece registrado correctamente."
-            )
-
-    except Exception as e:
-        print(f"Error en /afiliado UID={uid}: {e}")
-        await update.message.reply_text(
-            "❌ Hubo un error consultando tu UID. Intenta nuevamente más tarde."
-        )
-
-
-# ─────────────────────────────
 # ADMIN: CONSULTAR VOLUMEN POR UID
 # ─────────────────────────────
 async def voluid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -710,9 +691,7 @@ async def voluid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         vol_month = get_uid_volume(uid)
 
         if vol_month is None:
-            await update.message.reply_text(
-                "❌ No pude consultar ese UID en OKX."
-            )
+            await update.message.reply_text("❌ No pude consultar ese UID en OKX.")
             return
 
         update_user_volume_by_uid(uid, vol_month)
@@ -1109,11 +1088,11 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
 
-    # Usuario
+    # Comandos públicos / usuario
+    app.add_handler(CommandHandler("verificaruid", verificaruid))
     app.add_handler(CommandHandler("volumen", volumen))
-    app.add_handler(CommandHandler("afiliado", afiliado))
 
-    # Admin
+    # Comandos admin
     app.add_handler(CommandHandler("voluid", voluid))
     app.add_handler(CommandHandler("informe", informe))
     app.add_handler(CommandHandler("checkuid", checkuid))
