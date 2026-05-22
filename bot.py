@@ -38,6 +38,15 @@ OKX_API_PASSPHRASE = os.environ["OKX_API_PASSPHRASE"]
 BYPASS_CODE = os.environ.get("BYPASS_CODE", "00000000010101010")
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
+# Opcional en Render:
+# AFFILIATE_CODES=ELTRADERROLO,71790605,CRIPTOCRITERIO,FLANDERSYFRED
+# Si queda vacío, /afiliado solo valida si OKX devuelve ese UID dentro de tu API de afiliado.
+AFFILIATE_CODES = [
+    x.strip().upper()
+    for x in os.environ.get("AFFILIATE_CODES", "").split(",")
+    if x.strip()
+]
+
 # En Render usar:
 # DB_PATH=/var/data/trader_rolo_bot.db
 DB_PATH = os.environ.get("DB_PATH", "/var/data/trader_rolo_bot.db")
@@ -282,8 +291,6 @@ def parse_okx_invitee_detail(resp):
     dep_amt = float(pick("depAmt", "depositAmt", "totalDepAmt", default=0) or 0)
     wd_amt = float(pick("wdAmt", "withdrawAmt", default=0) or 0)
 
-    # Campos por ventana de tiempo.
-    # Si OKX los devuelve con otros nombres, usa /debuguid UID y agregamos los aliases.
     dep_15d = pick(
         "depAmt15d",
         "depAmt15D",
@@ -388,6 +395,20 @@ def get_uid_report(uid):
         "joined_at": local_user["joined_at"] if local_user else "",
         **parsed
     }
+
+
+def uid_matches_allowed_affiliate(uid):
+    report = get_uid_report(uid)
+
+    if report is None:
+        return False
+
+    # Si no configuraste AFFILIATE_CODES, cualquier UID que tu API pueda ver cuenta como válido.
+    if not AFFILIATE_CODES:
+        return True
+
+    affiliate_code = str(report.get("affiliate_code") or "").upper().strip()
+    return affiliate_code in AFFILIATE_CODES
 
 
 # ─────────────────────────────
@@ -613,6 +634,49 @@ async def volumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Hubo un error consultando tu volumen.\n"
             "Intenta nuevamente más tarde."
+        )
+
+
+# ─────────────────────────────
+# USUARIO: CONSULTAR SI SU UID ESTÁ CON AFILIADO AUTORIZADO
+# ─────────────────────────────
+async def afiliado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "Por seguridad, usa este comando por privado con el bot."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Uso:\n"
+            "/afiliado 123456789\n\n"
+            "Envía tu UID de OKX para verificar si está registrado correctamente."
+        )
+        return
+
+    uid = context.args[0].strip()
+
+    if not uid.isnumeric():
+        await update.message.reply_text("UID inválido. Usa solo números.")
+        return
+
+    try:
+        matched = uid_matches_allowed_affiliate(uid)
+
+        if matched:
+            await update.message.reply_text(
+                "✅ Tu UID está registrado correctamente."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Tu UID no aparece registrado correctamente."
+            )
+
+    except Exception as e:
+        print(f"Error en /afiliado UID={uid}: {e}")
+        await update.message.reply_text(
+            "❌ Hubo un error consultando tu UID. Intenta nuevamente más tarde."
         )
 
 
@@ -1044,11 +1108,14 @@ def main():
     app = Application.builder().token(BOT_TOKEN).defaults(defaults).build()
 
     app.add_handler(CommandHandler("start", start))
+
+    # Usuario
     app.add_handler(CommandHandler("volumen", volumen))
+    app.add_handler(CommandHandler("afiliado", afiliado))
+
+    # Admin
     app.add_handler(CommandHandler("voluid", voluid))
     app.add_handler(CommandHandler("informe", informe))
-
-    # Nuevos comandos admin de reporte
     app.add_handler(CommandHandler("checkuid", checkuid))
     app.add_handler(CommandHandler("checkuids", checkuids))
     app.add_handler(CommandHandler("checkuidscsv", checkuidscsv))
