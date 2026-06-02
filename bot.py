@@ -9,7 +9,8 @@ import sqlite3
 import requests
 import tempfile
 
-from datetime import datetime, timezone
+from urllib.parse import urlencode
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -45,6 +46,9 @@ DB_PATH = os.environ.get("DB_PATH", "/var/data/trader_rolo_bot.db")
 TZ_AR = ZoneInfo("America/Argentina/Buenos_Aires")
 GROUP_NAME = "Futuros Traders VIP by OKX"
 
+OKX_BASE_URL = "https://www.okx.com"
+INSTRUMENTS_CACHE = {}
+
 
 # ─────────────────────────────
 # UTILS
@@ -65,6 +69,13 @@ def number(value):
         return f"{float(value or 0):,.0f}"
     except Exception:
         return "0"
+
+
+def safe_float(value):
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
 
 
 def split_uids(raw_text: str):
@@ -223,10 +234,10 @@ def get_all_users():
 
 
 # ─────────────────────────────
-# OKX
+# OKX BASE
 # ─────────────────────────────
 def get_okx_server_time_iso():
-    r = requests.get("https://www.okx.com/api/v5/public/time", timeout=10)
+    r = requests.get(f"{OKX_BASE_URL}/api/v5/public/time", timeout=10)
     ts_ms = r.json()["data"][0]["ts"]
     dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -246,8 +257,7 @@ def sign_okx(method, path, body=""):
     return timestamp, signature
 
 
-def okx_affiliate_detail(uid):
-    path = f"/api/v5/affiliate/invitee/detail?uid={uid}"
+def okx_get(path):
     ts, signature = sign_okx("GET", path)
 
     headers = {
@@ -258,8 +268,21 @@ def okx_affiliate_detail(uid):
         "Content-Type": "application/json"
     }
 
-    url = "https://www.okx.com" + path
-    return requests.get(url, headers=headers, timeout=15).json()
+    url = OKX_BASE_URL + path
+    return requests.get(url, headers=headers, timeout=20).json()
+
+
+def okx_public_get(path):
+    url = OKX_BASE_URL + path
+    return requests.get(url, timeout=20).json()
+
+
+# ─────────────────────────────
+# OKX AFFILIATE
+# ─────────────────────────────
+def okx_affiliate_detail(uid):
+    path = f"/api/v5/affiliate/invitee/detail?uid={uid}"
+    return okx_get(path)
 
 
 def parse_okx_invitee_detail(resp):
@@ -384,6 +407,216 @@ def get_uid_report(uid):
         "joined_at": local_user["joined_at"] if local_user else "",
         **parsed
     }
+
+
+# ─────────────────────────────
+# OKX CUENTA PROPIA: VOLUMEN MAESTRO
+# ─────────────────────────────
+def okx_trade_fills_history(inst_type, begin_ms, end_ms, after=None, limit=100):
+    params = {
+        "instType": inst_type,
+        "begin": str(begin_ms),
+        "end": str(end_ms),
+        "limit": str(limit)
+    }
+
+    if after:
+        params["after"] = str(after)
+
+    path = "/api/v5/trade/fills-history?" + urlencode(params)
+    return okx_get(path)
+
+
+def get_instrument_info(inst_type, inst_id):
+    cache_key = f"{inst_type}:{inst_id}"
+
+    if cache_key in INSTRUMENTS_CACHE:
+        return INSTRUMENTS_CACHE[cache_key]
+
+    params = {
+        "instType": inst_type,
+        "instId": inst_id
+    }
+
+    path = "/api/v5/public/instruments?" + urlencode(params)
+    resp = okx_public_get(path)
+
+    if resp.get("code") == "0" and resp.get("data"):
+        info = resp["data"][0]
+        INSTRUMENTS_CACHE[cache_key] = info
+        return info
+
+    INSTRUMENTS_CACHE[cache_key] = {}
+    return {}
+
+
+def estimate_fill_volume_usdt(fill):
+    """
+    Estima el volumen notional del fill.
+
+    SPOT/MARGIN:
+    - volumen ≈ fillSz * fillPx
+
+    SWAP/FUTURES/OPTION:
+    - si ctValCcy es USD/USDT/USDC, volumen ≈ fillSz * ctVal
+    - si ctValCcy es moneda base, volumen ≈ fillSz * ctVal * fillPx
+    """
+    inst_type = fill.get("instType", "")
+    inst_id = fill.get("instId", "")
+
+    fill_sz = safe_float(fill.get("fillSz"))
+    fill_px = safe_float(fill.get("fillPx"))
+
+    if fill_sz <= 0 or fill_px <= 0:
+        return 0.0
+
+    if inst_type in ["SPOT", "MARGIN"]:
+        return fill_sz * fill_px
+
+    inst_info = get_instrument_info(inst_type, inst_id)
+
+    ct_val = safe_float(inst_info.get("ctVal"))
+    ct_val_ccy = str(inst_info.get("ctValCcy") or "").upper()
+
+    if ct_val <= 0:
+        return fill_sz * fill_px
+
+    if ct_val_ccy in ["USD", "USDT", "USDC"]:
+        return fill_sz * ct_val
+
+    return fill_sz * ct_val * fill_px
+
+
+def parse_period_to_days(args):
+    if not args:
+        return 7
+
+    raw = args[0].lower().strip()
+    raw = raw.replace("d", "")
+    raw = raw.replace("dias", "")
+    raw = raw.replace("días", "")
+    raw = raw.replace("dia", "")
+    raw = raw.replace("día", "")
+
+    try:
+        days = int(raw)
+    except Exception:
+        return None
+
+    if days <= 0:
+        return None
+
+    if days > 90:
+        days = 90
+
+    return days
+
+
+def get_master_trading_volume(days=7):
+    end_dt = datetime.now(timezone.utc)
+    begin_dt = end_dt - timedelta(days=days)
+
+    begin_ms = int(begin_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    inst_types = ["SPOT", "MARGIN", "SWAP", "FUTURES", "OPTION"]
+
+    total_volume = 0.0
+    total_fills = 0
+
+    by_type = {
+        "SPOT": 0.0,
+        "MARGIN": 0.0,
+        "SWAP": 0.0,
+        "FUTURES": 0.0,
+        "OPTION": 0.0
+    }
+
+    errors = []
+
+    for inst_type in inst_types:
+        after = None
+        pages = 0
+
+        while True:
+            pages += 1
+
+            if pages > 20:
+                break
+
+            try:
+                resp = okx_trade_fills_history(
+                    inst_type=inst_type,
+                    begin_ms=begin_ms,
+                    end_ms=end_ms,
+                    after=after,
+                    limit=100
+                )
+            except Exception as e:
+                errors.append(f"{inst_type}: {e}")
+                break
+
+            if resp.get("code") != "0":
+                errors.append(f"{inst_type}: code={resp.get('code')} msg={resp.get('msg')}")
+                break
+
+            data = resp.get("data") or []
+
+            if not data:
+                break
+
+            for fill in data:
+                vol = estimate_fill_volume_usdt(fill)
+                total_volume += vol
+                by_type[inst_type] += vol
+                total_fills += 1
+
+            last_bill_id = data[-1].get("billId")
+
+            if not last_bill_id:
+                break
+
+            after = last_bill_id
+
+            time.sleep(0.15)
+
+            if len(data) < 100:
+                break
+
+    return {
+        "days": days,
+        "begin": begin_dt.astimezone(TZ_AR).strftime("%Y-%m-%d %H:%M:%S"),
+        "end": end_dt.astimezone(TZ_AR).strftime("%Y-%m-%d %H:%M:%S"),
+        "total_volume": total_volume,
+        "total_fills": total_fills,
+        "by_type": by_type,
+        "errors": errors
+    }
+
+
+def format_master_volume_report(report):
+    errors_text = ""
+
+    if report["errors"]:
+        errors_text = "\n\n⚠️ Alertas:\n" + "\n".join(report["errors"][:5])
+
+    return (
+        f"📊 Volumen propio cuenta maestra OKX\n\n"
+        f"Periodo: últimos {report['days']} días\n"
+        f"Desde: {report['begin']} AR\n"
+        f"Hasta: {report['end']} AR\n\n"
+        f"Total estimado: {money(report['total_volume'])} USDT\n"
+        f"Fills encontrados: {report['total_fills']}\n\n"
+        f"Detalle por mercado:\n"
+        f"SPOT: {money(report['by_type'].get('SPOT'))} USDT\n"
+        f"MARGIN: {money(report['by_type'].get('MARGIN'))} USDT\n"
+        f"SWAP: {money(report['by_type'].get('SWAP'))} USDT\n"
+        f"FUTURES: {money(report['by_type'].get('FUTURES'))} USDT\n"
+        f"OPTION: {money(report['by_type'].get('OPTION'))} USDT\n\n"
+        f"Este cálculo usa únicamente trades/fills propios de la cuenta API.\n"
+        f"No incluye volumen de referidos."
+        f"{errors_text}"
+    )
 
 
 # ─────────────────────────────
@@ -658,6 +891,50 @@ async def volumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Hubo un error consultando tu volumen.\n"
             "Intenta nuevamente más tarde."
+        )
+
+
+# ─────────────────────────────
+# ADMIN: VOLUMEN PROPIO CUENTA MAESTRA
+# ─────────────────────────────
+async def mivolumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "Por seguridad, usa este comando en el chat privado con el bot."
+        )
+        return
+
+    admin_id = update.message.from_user.id
+
+    if not is_admin(admin_id):
+        await update.message.reply_text("❌ No autorizado.")
+        return
+
+    days = parse_period_to_days(context.args)
+
+    if days is None:
+        await update.message.reply_text(
+            "Uso:\n"
+            "/mivolumen\n"
+            "/mivolumen 7d\n"
+            "/mivolumen 15d\n"
+            "/mivolumen 30d\n\n"
+            "Máximo permitido: 90d."
+        )
+        return
+
+    await update.message.reply_text(
+        f"⏳ Consultando volumen propio de la cuenta maestra para los últimos {days} días..."
+    )
+
+    try:
+        report = get_master_trading_volume(days=days)
+        await update.message.reply_text(format_master_volume_report(report))
+    except Exception as e:
+        print(f"Error en /mivolumen: {e}")
+        await update.message.reply_text(
+            "❌ Error consultando el volumen propio de la cuenta maestra.\n"
+            "Verifica que la API key tenga permiso Read para trading/account."
         )
 
 
@@ -1094,6 +1371,7 @@ def main():
 
     # Comandos admin
     app.add_handler(CommandHandler("voluid", voluid))
+    app.add_handler(CommandHandler("mivolumen", mivolumen))
     app.add_handler(CommandHandler("informe", informe))
     app.add_handler(CommandHandler("checkuid", checkuid))
     app.add_handler(CommandHandler("checkuids", checkuids))
